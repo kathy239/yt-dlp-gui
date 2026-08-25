@@ -25,7 +25,9 @@ FONT_MONO = ("Consolas", 9)
 FONT_UI   = ("Segoe UI", 10)
 FONT_SM   = ("Segoe UI", 9)
 
-# ─── Config defaults ──────────────────────────────────────────────────────────
+# ─── Config defaults ─────────────────────────────────────────────────────────
+# Use local path. 
+# Downloads will now default to the same folder as the script
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "yt_downloader_config.json")
 
@@ -34,7 +36,7 @@ DEFAULT_CFG = {
     "asset_name":     "yt-dlp.exe",
     "ytdlp_dir":      SCRIPT_DIR,
     "auto_update":    False,
-    "output_dir":     os.path.expanduser("~/Downloads"),
+    "output_dir":     SCRIPT_DIR,
 }
 
 
