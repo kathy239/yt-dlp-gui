@@ -25,9 +25,7 @@ FONT_MONO = ("Consolas", 9)
 FONT_UI   = ("Segoe UI", 10)
 FONT_SM   = ("Segoe UI", 9)
 
-# ─── Config defaults ─────────────────────────────────────────────────────────
-# Use local path. 
-# Downloads will now default to the same folder as the script
+# ─── Config defaults ──────────────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "yt_downloader_config.json")
 
@@ -37,6 +35,8 @@ DEFAULT_CFG = {
     "ytdlp_dir":      SCRIPT_DIR,
     "auto_update":    False,
     "output_dir":     SCRIPT_DIR,
+    "cdn_blocklist":  "",
+    "extra_args":     "",
 }
 
 
@@ -72,7 +72,7 @@ class SettingsDialog(tk.Toplevel):
         self._on_save = on_save
         self._build()
         self.update_idletasks()
-        w, h = 580, 420
+        w, h = 580, 580
         px = parent.winfo_rootx() + parent.winfo_width()  // 2 - w // 2
         py = parent.winfo_rooty() + parent.winfo_height() // 2 - h // 2
         self.geometry(f"{w}x{h}+{px}+{py}")
@@ -157,6 +157,22 @@ class SettingsDialog(tk.Toplevel):
                        activebackground=BG, activeforeground=TEXT,
                        font=FONT_UI, cursor="hand2").pack(anchor="w", pady=(12, 0))
 
+        # ── CDN blocklist ─────────────────────────────────────────────────────
+        section("CDN blocklist  (comma-separated hostnames to skip)")
+        self._cdn_var = tk.StringVar(value=self._cfg.get("cdn_blocklist", ""))
+        tk.Entry(body, textvariable=self._cdn_var, bg=PANEL, fg=TEXT,
+                 insertbackground=TEXT, relief="flat", font=FONT_UI, bd=6,
+                 highlightthickness=1, highlightbackground=BORDER).pack(fill="x", pady=(0, 2))
+        hint("yt-dlp will retry with a different CDN mirror when a blocked host is detected in the download URL.  ")
+
+        # ── Extra yt-dlp flags ────────────────────────────────────────────────
+        section("Extra yt-dlp arguments  (advanced)")
+        self._extra_var = tk.StringVar(value=self._cfg.get("extra_args", ""))
+        tk.Entry(body, textvariable=self._extra_var, bg=PANEL, fg=TEXT,
+                 insertbackground=TEXT, relief="flat", font=FONT_UI, bd=6,
+                 highlightthickness=1, highlightbackground=BORDER).pack(fill="x", pady=(0, 2))
+        hint("Raw flags appended to every yt-dlp command.  e.g.  --no-playlist  --sponsorblock-remove all")
+
         # ── Buttons ───────────────────────────────────────────────────────────
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
         btn_bar = tk.Frame(self, bg=BG, padx=20, pady=12)
@@ -180,6 +196,8 @@ class SettingsDialog(tk.Toplevel):
         self._cfg["asset_name"]     = self._asset_var.get().strip()
         self._cfg["ytdlp_dir"]      = self._dir_var.get().strip()
         self._cfg["auto_update"]    = self._auto_var.get()
+        self._cfg["cdn_blocklist"]  = self._cdn_var.get().strip()
+        self._cfg["extra_args"]     = self._extra_var.get().strip()
         save_config(self._cfg)
         self._on_save(self._cfg)
         self.destroy()
@@ -204,9 +222,10 @@ class YTDownloader(tk.Tk):
         self.res_var    = tk.StringVar(value="best")
         self.format_var = tk.StringVar(value="mp4")
         self.audio_fmt  = tk.StringVar(value="mp3")
-        self.proc       = None
-        self.fetching   = False
-        self.updating   = False
+        self.proc         = None
+        self.fetching     = False
+        self.updating     = False
+        self._user_stopped = False
 
         self._build_ui()
         self._mode_changed()
@@ -745,10 +764,20 @@ class YTDownloader(tk.Tk):
         return None
 
     # ── Build yt-dlp download command ──────────────────────────────────────────
-    def _build_command(self, exe, url):
+    def _build_command(self, exe, url, blocked_cdns=None):
+        import shlex
         mode = self.mode_var.get()
         out  = os.path.join(self.output_dir.get(), "%(title)s.%(ext)s")
         cmd  = [exe, "--newline", "-o", out]
+
+        # Always use fast-fail so bad CDN mirrors are detected quickly
+        cmd += ["--retries", "2", "--fragment-retries", "2"]
+
+        # Dynamic CDN blocklist built up during this session
+        if blocked_cdns:
+            # bilibili multi-CDC: ask the API for an alternate mirror set
+            cmd += ["--extractor-args", "bilibili:prefer_multi_cdc=1"]
+
         if mode == "audio":
             fmt = self.audio_fmt.get()
             cmd += ["-x", "--audio-format", fmt, "--audio-quality", "0"]
@@ -764,6 +793,12 @@ class YTDownloader(tk.Tk):
                          f"bestvideo[height<={h}]+bestaudio/"
                          f"best[height<={h}]/best")
             cmd += ["-f", f_sel, "--merge-output-format", fmt]
+
+        # Extra user-defined flags
+        extra = self.cfg.get("extra_args", "").strip()
+        if extra:
+            cmd += shlex.split(extra)
+
         cmd.append(url)
         return cmd
 
@@ -783,59 +818,131 @@ class YTDownloader(tk.Tk):
                 "yt-dlp was not found.\n\n"
                 "Use the  ⬇ Download / Update  button to install it.")
             return
-        cmd = self._build_command(exe, url)
+        self._user_stopped = False
         self._log("── Starting download ──", "info")
-        self._log("$ " + " ".join(cmd), "dim")
         self._dl_btn.configure(state="disabled")
         self._stop_btn.configure(state="normal")
         self._progress.configure(value=0)
         self._prog_label.configure(text="0%", fg=SUBTEXT)
         self._speed_label.configure(text="")
         self._set_status(WARNING)
-        threading.Thread(target=self._run_download, args=(cmd,), daemon=True).start()
+        # Start with an empty dynamic blocklist for this download session
+        threading.Thread(target=self._run_download,
+                         args=(exe, url, set()), daemon=True).start()
 
-    def _run_download(self, cmd):
+    def _run_download(self, exe, url, blocked_cdns, attempt=1):
+        """
+        Run yt-dlp and watch its output for CDN errors.
+        When a failing CDN hostname is detected, terminate, add it to the
+        dynamic blocklist, and automatically restart with prefer_multi_cdc=1
+        so yt-dlp requests a fresh mirror from the site's API.
+        Up to MAX_CDN_RETRIES automatic CDN switches are allowed.
+        """
+        MAX_CDN_RETRIES = 5
+        # Regex to pull a hostname out of yt-dlp's "Got error: HTTP Error NNN"
+        # lines which include the URL that failed.
+        cdn_error_re = re.compile(
+            r'Got error:.*?https?://([^/?#\s]+)', re.IGNORECASE)
+        http_error_re = re.compile(
+            r'HTTP Error (\d+)', re.IGNORECASE)
+
+        if blocked_cdns:
+            self.after(0, lambda b=set(blocked_cdns): self._log(
+                f"  ↻ Retry attempt {attempt}  —  skipping: {', '.join(sorted(b))}", "warn"))
+
+        cmd = self._build_command(exe, url, blocked_cdns)
+        self.after(0, lambda c=cmd: self._log("$ " + " ".join(c), "dim"))
+
+        failed_cdn = None   # hostname detected as failing in this run
+        stopped    = False  # user hit Stop
+
         try:
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+
             for line in self.proc.stdout:
                 line = line.rstrip()
                 if not line:
                     continue
+
                 tag = self._classify_line(line)
                 self.after(0, lambda l=line, t=tag: self._log(l, t))
+
+                # Track download progress
                 if "[download]" in line and "%" in line:
                     pct, speed, eta = self._parse_progress(line)
                     if pct is not None:
                         self.after(0, lambda p=pct, s=speed, e=eta:
                                    self._update_progress(p, s, e))
+
+                # Detect a CDN failure — extract the hostname from the error line
+                if "Got error" in line and "HTTP Error" in line:
+                    m_cdn  = cdn_error_re.search(line)
+                    m_http = http_error_re.search(line)
+                    if m_cdn and m_http:
+                        host = m_cdn.group(1)
+                        code = m_http.group(1)
+                        # Only auto-switch on 5xx / connection errors, not 403/404
+                        if int(code) >= 500 or code in ("0",):
+                            if host not in blocked_cdns:
+                                failed_cdn = host
+                                self.after(0, lambda h=host, c=code: self._log(
+                                    f"  ⚠ CDN failure ({c}) detected: {h}  —  switching mirror…",
+                                    "warn"))
+                                # Terminate early — no need to exhaust all retries
+                                self.proc.terminate()
+                                break
+
             self.proc.wait()
             rc = self.proc.returncode
-            if rc == 0:
-                self.after(0, lambda: self._progress.configure(value=100))
-                self.after(0, lambda: self._prog_label.configure(text="100%", fg=SUCCESS))
-                self.after(0, lambda: self._speed_label.configure(text="Done ✓", fg=SUCCESS))
-                self.after(0, lambda: self._log("✓ Download complete!", "ok"))
-                self.after(0, lambda: self._set_status(SUCCESS))
-            elif rc == -1:
-                self.after(0, lambda: self._prog_label.configure(text="Stopped", fg=WARNING))
-                self.after(0, lambda: self._speed_label.configure(text=""))
-                self.after(0, lambda: self._log("⏹ Stopped by user.", "warn"))
-                self.after(0, lambda: self._set_status(SUBTEXT))
-            else:
-                self.after(0, lambda: self._prog_label.configure(text="Error", fg=ACCENT))
-                self.after(0, lambda: self._speed_label.configure(text=""))
-                self.after(0, lambda: self._log(f"✗ Exit code {rc}", "err"))
-                self.after(0, lambda: self._set_status(ACCENT))
+
         except Exception as ex:
             self.after(0, lambda: self._log(f"✗ Exception: {ex}", "err"))
             self.after(0, lambda: self._set_status(ACCENT))
-        finally:
             self.proc = None
             self.after(0, self._download_done)
+            return
+
+        # ── CDN switch: restart with the bad host blocked ───────────────────
+        if failed_cdn and attempt < MAX_CDN_RETRIES and not self._user_stopped:
+            blocked_cdns = set(blocked_cdns) | {failed_cdn}
+            self.proc = None
+            self.after(0, lambda: self._progress.configure(value=0))
+            self.after(0, lambda: self._prog_label.configure(text="0%", fg=SUBTEXT))
+            self.after(0, lambda: self._speed_label.configure(text="Switching CDN…"))
+            threading.Thread(target=self._run_download,
+                             args=(exe, url, blocked_cdns, attempt + 1),
+                             daemon=True).start()
+            return
+
+        # ── Final outcome ───────────────────────────────────────────────────
+        if rc == 0:
+            self.after(0, lambda: self._progress.configure(value=100))
+            self.after(0, lambda: self._prog_label.configure(text="100%", fg=SUCCESS))
+            self.after(0, lambda: self._speed_label.configure(text="Done ✓", fg=SUCCESS))
+            self.after(0, lambda: self._log("✓ Download complete!", "ok"))
+            self.after(0, lambda: self._set_status(SUCCESS))
+        elif failed_cdn and attempt >= MAX_CDN_RETRIES:
+            self.after(0, lambda: self._prog_label.configure(text="CDN failed", fg=ACCENT))
+            self.after(0, lambda: self._speed_label.configure(text=""))
+            self.after(0, lambda: self._log(
+                f"✗ Exhausted {MAX_CDN_RETRIES} CDN attempts. "
+                "Try adding the site's CDN domains to the blocklist in Settings.", "err"))
+            self.after(0, lambda: self._set_status(ACCENT))
+        elif self._user_stopped or rc == -1 or rc is None:
+            self.after(0, lambda: self._prog_label.configure(text="Stopped", fg=WARNING))
+            self.after(0, lambda: self._speed_label.configure(text=""))
+            self.after(0, lambda: self._log("⏹ Stopped by user.", "warn"))
+            self.after(0, lambda: self._set_status(SUBTEXT))
+        else:
+            self.after(0, lambda: self._prog_label.configure(text="Error", fg=ACCENT))
+            self.after(0, lambda: self._speed_label.configure(text=""))
+            self.after(0, lambda: self._log(f"✗ Exit code {rc}", "err"))
+            self.after(0, lambda: self._set_status(ACCENT))
+        self.after(0, self._download_done)
 
     def _parse_progress(self, line):
         pct = speed = eta = None
@@ -870,10 +977,13 @@ class YTDownloader(tk.Tk):
         return ""
 
     def _download_done(self):
+        self.proc = None
         self._dl_btn.configure(state="normal")
         self._stop_btn.configure(state="disabled")
 
     def _stop_download(self):
+        # Signal that the user wants to stop — the CDN retry loop checks this
+        self._user_stopped = True
         if self.proc:
             self.proc.terminate()
             self._log("Stopping…", "warn")
